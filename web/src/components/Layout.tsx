@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/store/auth";
 import { useAppConfigStore } from "@/store/appConfig";
+import { usePermissionsStore } from "@/store/permissions";
 import { useNotificationsStore } from "@/store/notifications";
 import { runsApi, type ExecutionRun } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -15,9 +16,21 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const appName = useAppConfigStore((s) => s.name);
   const appVersion = useAppConfigStore((s) => s.version);
   const terminalEnabled = useAppConfigStore((s) => s.terminalEnabled);
+  const perms = usePermissionsStore((s) => s.perms);
+  const loadPerms = usePermissionsStore((s) => s.load);
   const [activeCount, setActiveCount] = useState(0);
   const [mobileOpen, setMobileOpen] = useState(false);
   const addNotification = useNotificationsStore((s) => s.add);
+
+  // Pull the current user's effective permissions once after the layout
+  // mounts (i.e. after auth has happened). Used below to hide nav items
+  // the user has no access to. Server enforces the same gates either way.
+  useEffect(() => {
+    loadPerms();
+  }, [loadPerms]);
+
+  const canSeeScripts = isAdmin || !perms || perms.is_admin || perms.operations.includes("scripts:read");
+  const canSeePipelines = isAdmin || !perms || perms.is_admin || perms.operations.includes("pipelines:read");
 
   // Auto-close the mobile drawer when the route changes (tap-to-navigate UX).
   useEffect(() => {
@@ -118,8 +131,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
 
   const nav = [
     { label: "Dashboard", href: "/dashboard", icon: LayoutDashboard, badge: 0 },
-    { label: "Pipelines", href: "/pipelines", icon: SlidersHorizontal, badge: 0 },
-    { label: "Scripts", href: "/scripts", icon: Terminal, badge: 0 },
+    ...(canSeePipelines ? [{ label: "Pipelines", href: "/pipelines", icon: SlidersHorizontal, badge: 0 }] : []),
+    ...(canSeeScripts ? [{ label: "Scripts", href: "/scripts", icon: Terminal, badge: 0 }] : []),
     { label: "Active Runs", href: "/active", icon: Activity, badge: activeCount },
     { label: "Run History", href: "/runs", icon: History, badge: 0 },
     ...(terminalEnabled

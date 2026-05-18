@@ -95,11 +95,16 @@ func NewHandler(db *gorm.DB, loader *pipeline.Loader, scriptLoader *script.Loade
 }
 
 // GET /api/pipelines
+// Filtered by group visibility — users only see pipelines their groups
+// have access to (admins see all). The pipelines:read operation also
+// gates this: without it, the list is empty even when visibility is wide.
 func (h *Handler) ListPipelines(c echo.Context) error {
 	pipelines, err := h.loader.List()
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to load pipelines")
 	}
+	perms := auth.GetPermissions(c, h.db)
+	canRead := perms.IsAdmin || perms.Has(auth.OpPipelinesRead)
 	type summary struct {
 		ID          string `json:"id"`
 		Name        string `json:"name"`
@@ -107,22 +112,30 @@ func (h *Handler) ListPipelines(c echo.Context) error {
 		Version     string `json:"version"`
 		ParamCount  int    `json:"param_count"`
 	}
-	summaries := make([]summary, len(pipelines))
-	for i, p := range pipelines {
-		summaries[i] = summary{
+	summaries := make([]summary, 0, len(pipelines))
+	for _, p := range pipelines {
+		if !canRead || !perms.CanSeePipeline(p.ID) {
+			continue
+		}
+		summaries = append(summaries, summary{
 			ID:          p.ID,
 			Name:        p.Name,
 			Description: p.Description,
 			Version:     p.Version,
 			ParamCount:  len(p.Parameters),
-		}
+		})
 	}
 	return c.JSON(http.StatusOK, summaries)
 }
 
 // GET /api/pipelines/:id
 func (h *Handler) GetPipeline(c echo.Context) error {
-	p, err := h.loader.Get(c.Param("id"))
+	id := c.Param("id")
+	perms := auth.GetPermissions(c, h.db)
+	if !perms.IsAdmin && (!perms.Has(auth.OpPipelinesRead) || !perms.CanSeePipeline(id)) {
+		return echo.NewHTTPError(http.StatusNotFound, "pipeline not found")
+	}
+	p, err := h.loader.Get(id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "pipeline not found")
 	}
@@ -131,7 +144,12 @@ func (h *Handler) GetPipeline(c echo.Context) error {
 
 // GET /api/pipelines/:id/raw
 func (h *Handler) GetPipelineRaw(c echo.Context) error {
-	raw, err := h.loader.GetRaw(c.Param("id"))
+	id := c.Param("id")
+	perms := auth.GetPermissions(c, h.db)
+	if !perms.IsAdmin && (!perms.Has(auth.OpPipelinesRead) || !perms.CanSeePipeline(id)) {
+		return echo.NewHTTPError(http.StatusNotFound, "pipeline not found")
+	}
+	raw, err := h.loader.GetRaw(id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "pipeline not found")
 	}
@@ -310,7 +328,8 @@ func (h *Handler) DeletePipeline(c echo.Context) error {
 	return c.JSON(http.StatusOK, echo.Map{"message": "pipeline deleted"})
 }
 
-// GET /api/runs — admins see all runs, users see their own.
+// GET /api/runs — admins and users with runs:read_all see everyone's runs;
+// everyone else sees only their own.
 // Pagination: ?page=1&limit=50. If page is omitted, returns all (legacy, max 500).
 //
 // LogsJSON is always omitted from list responses — those rows can be megabytes
@@ -318,6 +337,8 @@ func (h *Handler) DeletePipeline(c echo.Context) error {
 // demand via GET /api/runs/:id/logs.
 func (h *Handler) ListRuns(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 
 	pageStr := c.QueryParam("page")
 	limitStr := c.QueryParam("limit")
@@ -327,7 +348,7 @@ func (h *Handler) ListRuns(c echo.Context) error {
 		// should use /api/runs/active or paginated /api/runs?page=1.
 		var runs []dbpkg.ExecutionRun
 		legacyQ := h.db.Omit("logs_json").Order("created_at desc").Limit(500)
-		if !claims.IsAdmin {
+		if !seeAll {
 			legacyQ = legacyQ.Where("user_id = ?", claims.UserID)
 		}
 		legacyQ.Find(&runs)
@@ -345,7 +366,7 @@ func (h *Handler) ListRuns(c echo.Context) error {
 
 	var total int64
 	qCount := h.db.Model(&dbpkg.ExecutionRun{})
-	if !claims.IsAdmin {
+	if !seeAll {
 		qCount = qCount.Where("user_id = ?", claims.UserID)
 	}
 	qCount.Count(&total)
@@ -353,7 +374,7 @@ func (h *Handler) ListRuns(c echo.Context) error {
 	var runs []dbpkg.ExecutionRun
 	offset := (page - 1) * limit
 	qData := h.db.Omit("logs_json").Order("created_at desc").Limit(limit).Offset(offset)
-	if !claims.IsAdmin {
+	if !seeAll {
 		qData = qData.Where("user_id = ?", claims.UserID)
 	}
 	qData.Find(&runs)
@@ -392,25 +413,29 @@ type activeRunSummary struct {
 // idx_runs_status_created.
 func (h *Handler) ListActiveRuns(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 
 	var runs []activeRunSummary
 	q := h.db.Model(&dbpkg.ExecutionRun{}).
 		Select("id, pipeline_id, pipeline_name, user_id, user_name, status, started_at, created_at").
 		Where("status IN ?", []string{"running", "queued"}).
 		Order("created_at desc")
-	if !claims.IsAdmin {
+	if !seeAll {
 		q = q.Where("user_id = ?", claims.UserID)
 	}
 	q.Find(&runs)
 	return c.JSON(http.StatusOK, runs)
 }
 
-// GET /api/runs/:id — admins can access any run
+// GET /api/runs/:id — admins and users with runs:read_all can access any run.
 func (h *Handler) GetRun(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 	var run dbpkg.ExecutionRun
 	q := h.db.Where("id = ?", c.Param("id"))
-	if !claims.IsAdmin {
+	if !seeAll {
 		q = q.Where("user_id = ?", claims.UserID)
 	}
 	if err := q.First(&run).Error; err != nil {
@@ -419,9 +444,11 @@ func (h *Handler) GetRun(c echo.Context) error {
 	return c.JSON(http.StatusOK, run)
 }
 
-// GET /api/runs/:id/logs — admins can access any run's logs
+// GET /api/runs/:id/logs — admins and users with runs:read_all can access any run's logs
 func (h *Handler) GetRunLogs(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 
 	// For running pipelines, the live in-memory backlog is authoritative;
 	// skip the DB query entirely.
@@ -432,7 +459,7 @@ func (h *Handler) GetRunLogs(c echo.Context) error {
 				// Authorize: load just the user_id column to confirm access.
 				var run dbpkg.ExecutionRun
 				if err := h.db.Select("id, user_id, status").Where("id = ?", id64).First(&run).Error; err == nil {
-					if claims.IsAdmin || run.UserID == claims.UserID {
+					if seeAll || run.UserID == claims.UserID {
 						return c.JSON(http.StatusOK, activeRun.GetMessages())
 					}
 				}
@@ -441,7 +468,7 @@ func (h *Handler) GetRunLogs(c echo.Context) error {
 	}
 
 	q := h.db.Select("id, user_id, logs_json, status").Where("id = ?", c.Param("id"))
-	if !claims.IsAdmin {
+	if !seeAll {
 		q = q.Where("user_id = ?", claims.UserID)
 	}
 	var run dbpkg.ExecutionRun
@@ -1002,15 +1029,26 @@ func (h *Handler) ListScripts(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to load scripts")
 	}
-	if scripts == nil {
-		scripts = []script.Script{}
+	perms := auth.GetPermissions(c, h.db)
+	canRead := perms.IsAdmin || perms.Has(auth.OpScriptsRead)
+	out := make([]script.Script, 0, len(scripts))
+	for _, s := range scripts {
+		if !canRead || !perms.CanSeeScript(s.ID) {
+			continue
+		}
+		out = append(out, s)
 	}
-	return c.JSON(http.StatusOK, scripts)
+	return c.JSON(http.StatusOK, out)
 }
 
 // GET /api/scripts/:id
 func (h *Handler) GetScript(c echo.Context) error {
-	s, err := h.scriptLoader.Get(c.Param("id"))
+	id := c.Param("id")
+	perms := auth.GetPermissions(c, h.db)
+	if !perms.IsAdmin && (!perms.Has(auth.OpScriptsRead) || !perms.CanSeeScript(id)) {
+		return echo.NewHTTPError(http.StatusNotFound, "script not found")
+	}
+	s, err := h.scriptLoader.Get(id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "script not found")
 	}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"gorm.io/gorm"
 
 	"github.com/codeci/codeci/server/auth"
 	"github.com/codeci/codeci/server/config"
@@ -16,12 +17,14 @@ import (
 )
 
 type ScriptHandler struct {
+	db           *gorm.DB
 	scriptLoader *script.Loader
 	jwtSecret    string
 }
 
-func NewScriptHandler(scriptLoader *script.Loader, cfg *config.Config) *ScriptHandler {
+func NewScriptHandler(db *gorm.DB, scriptLoader *script.Loader, cfg *config.Config) *ScriptHandler {
 	return &ScriptHandler{
+		db:           db,
 		scriptLoader: scriptLoader,
 		jwtSecret:    cfg.JWTSecret,
 	}
@@ -40,6 +43,20 @@ func (h *ScriptHandler) Execute(c echo.Context) error {
 	}
 
 	scriptID := c.Param("id")
+
+	// Group-based authz: visibility + scripts:run. Admins bypass.
+	// Return 404 (not 403) when the script isn't visible so we don't
+	// leak script IDs to non-members.
+	perms := auth.LoadEffectivePermissions(h.db, claims.UserID, claims.IsAdmin)
+	if !perms.IsAdmin {
+		if !perms.CanSeeScript(scriptID) {
+			return echo.NewHTTPError(http.StatusNotFound, "script not found")
+		}
+		if !perms.Has(auth.OpScriptsRun) {
+			return echo.NewHTTPError(http.StatusForbidden, "missing required permission: "+auth.OpScriptsRun)
+		}
+	}
+
 	filename, err := h.scriptLoader.GetFilename(scriptID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "script not found")

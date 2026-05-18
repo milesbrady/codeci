@@ -281,6 +281,64 @@ export const adminApi = {
     }
   ) => http.put(`/admin/users/${id}`, data),
   deleteUser: (id: number) => http.delete(`/admin/users/${id}`),
+  getUserGroups: (id: number) =>
+    http.get<{ group_ids: number[] }>(`/admin/users/${id}/groups`),
+  setUserGroups: (id: number, groupIDs: number[]) =>
+    http.put(`/admin/users/${id}/groups`, { group_ids: groupIDs }),
+};
+
+export interface GroupInfo {
+  id: number;
+  name: string;
+  description: string;
+  is_system: boolean;
+  pipeline_mode: "all" | "selected";
+  script_mode: "all" | "selected";
+  operations: string[];
+  pipeline_ids: string[];
+  script_ids: string[];
+  member_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GroupWritePayload {
+  name: string;
+  description: string;
+  pipeline_mode: "all" | "selected";
+  script_mode: "all" | "selected";
+  operations: string[];
+  pipeline_ids: string[];
+  script_ids: string[];
+}
+
+export interface GroupDetail {
+  group: GroupInfo;
+  members: Array<{ id: number; username: string; email: string; role: string }>;
+}
+
+export const groupsApi = {
+  list: () => http.get<GroupInfo[]>("/admin/groups"),
+  get: (id: number) => http.get<GroupDetail>(`/admin/groups/${id}`),
+  create: (payload: GroupWritePayload) =>
+    http.post<GroupInfo>("/admin/groups", payload),
+  update: (id: number, payload: GroupWritePayload) =>
+    http.put<GroupInfo>(`/admin/groups/${id}`, payload),
+  remove: (id: number) => http.delete(`/admin/groups/${id}`),
+};
+
+export interface MyPermissions {
+  is_admin: boolean;
+  operations: string[];
+  all_operations: string[];
+  all_pipelines: boolean;
+  pipeline_ids: string[];
+  all_scripts: boolean;
+  script_ids: string[];
+}
+
+export const meExtraApi = {
+  permissions: () => http.get<MyPermissions>("/me/permissions"),
 };
 
 export interface AppSettings {

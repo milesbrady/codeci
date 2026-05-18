@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import {
   adminApi,
   githubApi,
+  groupsApi,
   settingsApi,
   type AppSettings,
   type CreateUserPayload,
   type GitHubStatus,
+  type GroupInfo,
   type UserInfo,
 } from "@/lib/api";
 import { Layout, PageHeader } from "@/components/Layout";
@@ -15,6 +17,8 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useAuthStore } from "@/store/auth";
 import { useAppConfigStore } from "@/store/appConfig";
+import { GroupsCard } from "@/components/GroupsCard";
+import { cn } from "@/lib/utils";
 import {
   Users,
   Plus,
@@ -32,7 +36,18 @@ import {
   Link2,
   Link2Off,
   RefreshCw,
+  SlidersHorizontal,
 } from "lucide-react";
+
+type SettingsTab = "general" | "auth" | "github" | "users" | "groups";
+
+const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; icon: typeof Users }> = [
+  { id: "general", label: "General",        icon: SlidersHorizontal },
+  { id: "auth",    label: "Authentication", icon: Cloud },
+  { id: "github",  label: "GitHub",         icon: Webhook },
+  { id: "users",   label: "Users",          icon: Users },
+  { id: "groups",  label: "Groups",         icon: ShieldCheck },
+];
 
 const PAGE_SIZE_KEY = "runHistory.pageSize";
 const DEFAULT_PAGE_SIZE = 25;
@@ -86,14 +101,49 @@ function UserModal({
   const [email, setEmail] = useState(user?.email ?? "");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"admin" | "user">(user?.role ?? "user");
+  const [groups, setGroups] = useState<GroupInfo[]>([]);
+  const [selectedGroupIDs, setSelectedGroupIDs] = useState<Set<number>>(new Set());
+  const [groupsLoading, setGroupsLoading] = useState(true);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Load groups + the user's current memberships once on open. For "create"
+  // we still need the group list so the admin can pre-assign on creation;
+  // selectedGroupIDs starts empty until the user toggles checkboxes.
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const [glist, mine] = await Promise.all([
+          groupsApi.list(),
+          mode === "edit" && user ? adminApi.getUserGroups(user.id) : Promise.resolve({ data: { group_ids: [] as number[] } }),
+        ]);
+        if (cancelled) return;
+        setGroups(glist.data);
+        setSelectedGroupIDs(new Set(mine.data.group_ids));
+      } finally {
+        if (!cancelled) setGroupsLoading(false);
+      }
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, user]);
+
+  function toggleGroup(id: number) {
+    const next = new Set(selectedGroupIDs);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelectedGroupIDs(next);
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
     setLoading(true);
     try {
+      let targetUserID: number | null = user?.id ?? null;
       if (mode === "create") {
         if (!username) { setError("Username is required."); setLoading(false); return; }
         if (authProvider === "local") {
@@ -109,7 +159,8 @@ function UserModal({
         };
         if (authProvider === "local") payload.password = password;
         if (email) payload.email = email;
-        await adminApi.createUser(payload);
+        const created = await adminApi.createUser(payload);
+        targetUserID = created.data.id;
       } else if (mode === "edit" && user) {
         const updates: { role?: "admin" | "user"; password?: string; email?: string } = {};
         if (role !== user.role) updates.role = role;
@@ -124,6 +175,12 @@ function UserModal({
           updates.password = password;
         }
         await adminApi.updateUser(user.id, updates);
+      }
+      // Always write group memberships — covers "create + assign" in one
+      // round-trip from the admin's POV, and "edit + adjust groups" when
+      // only the group set changed. Backend replaces the entire set.
+      if (targetUserID != null) {
+        await adminApi.setUserGroups(targetUserID, Array.from(selectedGroupIDs));
       }
       onDone();
       onClose();
@@ -254,6 +311,49 @@ function UserModal({
               </button>
             </div>
           </div>
+          <div className="space-y-1.5">
+            <label className="text-xs text-zinc-400 flex items-center gap-1.5">
+              <ShieldCheck className="h-3.5 w-3.5" />
+              Groups
+            </label>
+            {groupsLoading ? (
+              <p className="text-xs text-zinc-500">Loading…</p>
+            ) : groups.length === 0 ? (
+              <p className="text-xs text-zinc-500">No groups yet. Create one in the Groups tab.</p>
+            ) : (
+              <div className="max-h-40 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/40 divide-y divide-zinc-800">
+                {groups.map((g) => (
+                  <label
+                    key={g.id}
+                    className="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-zinc-900 min-h-11"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedGroupIDs.has(g.id)}
+                      onChange={() => toggleGroup(g.id)}
+                      className="h-4 w-4 rounded border-zinc-600 bg-zinc-900"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm text-zinc-200 truncate flex items-center gap-2">
+                        {g.name}
+                        {g.is_system && <Badge variant="default" className="text-[9px]">system</Badge>}
+                      </p>
+                      {g.description && (
+                        <p className="text-[11px] text-zinc-500 truncate">{g.description}</p>
+                      )}
+                    </div>
+                    <span className="text-[10px] text-zinc-600 flex-shrink-0">
+                      {g.operations.length} ops
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+            <p className="text-[11px] text-zinc-500">
+              Admins bypass groups, so memberships only affect non-admin users.
+            </p>
+          </div>
+
           {error && <p className="text-xs text-red-400">{error}</p>}
           {mode === "create" && authProvider === "local" && (
             <p className="text-xs text-zinc-500">
@@ -678,6 +778,17 @@ function GitHubSettingsCard({
 export function Settings() {
   const { username: currentUsername } = useAuthStore();
   const setAppName = useAppConfigStore((s) => s.setName);
+  // Tab state lives in the URL hash (#users / #groups / etc.) so an admin
+  // can deep-link or refresh and land back where they were.
+  const [tab, setTab] = useState<SettingsTab>(() => {
+    const h = window.location.hash.replace("#", "");
+    return (SETTINGS_TABS.find((t) => t.id === h)?.id ?? "general") as SettingsTab;
+  });
+  useEffect(() => {
+    if (window.location.hash !== `#${tab}`) {
+      window.history.replaceState({}, "", `#${tab}`);
+    }
+  }, [tab]);
   const [users, setUsers] = useState<UserInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalMode, setModalMode] = useState<ModalMode>(null);
@@ -850,8 +961,36 @@ export function Settings() {
         description="Manage users and system configuration"
       />
 
+      {/* Tab bar — horizontally scrollable on small screens. -mb-px so the
+          active tab's border-bottom merges with the surrounding divider. */}
+      <div className="border-b border-zinc-800 px-2 md:px-8">
+        <div className="flex gap-1 overflow-x-auto -mb-px">
+          {SETTINGS_TABS.map((t) => {
+            const Icon = t.icon;
+            const active = tab === t.id;
+            return (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={cn(
+                  "flex items-center gap-2 px-3 sm:px-4 py-3 text-sm font-medium whitespace-nowrap border-b-2 transition-colors min-h-11",
+                  active
+                    ? "border-violet-500 text-violet-300"
+                    : "border-transparent text-zinc-400 hover:text-zinc-200"
+                )}
+                aria-selected={active}
+                role="tab"
+              >
+                <Icon className="h-4 w-4" />
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <div className="p-4 md:p-8 space-y-6">
-        {/* Stats */}
+        {/* Stats — visible on all tabs as a quick at-a-glance summary. */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           {[
             { label: "Total Users", value: stats.total },
@@ -867,6 +1006,7 @@ export function Settings() {
           ))}
         </div>
 
+        {tab === "general" && <>
         {/* Application Branding & Version */}
         <Card>
           <CardHeader>
@@ -905,15 +1045,6 @@ export function Settings() {
             </div>
           </CardContent>
         </Card>
-
-        {appSettings && <EntraSettingsCard initial={appSettings} onSaved={fetchSettings} />}
-        {appSettings && (
-          <GitHubSettingsCard
-            initial={appSettings}
-            onSaved={fetchSettings}
-            banner={githubBanner}
-          />
-        )}
 
         {/* Pipeline History Settings */}
         <Card>
@@ -997,8 +1128,24 @@ export function Settings() {
             </div>
           </CardContent>
         </Card>
+        </>}
 
-        {/* User table */}
+        {tab === "auth" && appSettings && (
+          <EntraSettingsCard initial={appSettings} onSaved={fetchSettings} />
+        )}
+
+        {tab === "github" && appSettings && (
+          <GitHubSettingsCard
+            initial={appSettings}
+            onSaved={fetchSettings}
+            banner={githubBanner}
+          />
+        )}
+
+        {tab === "groups" && <GroupsCard />}
+
+        {tab === "users" && (
+        /* User table */
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between">
@@ -1235,6 +1382,7 @@ export function Settings() {
             )}
           </CardContent>
         </Card>
+        )}
       </div>
 
       {/* Create / Edit modal */}

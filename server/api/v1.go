@@ -92,20 +92,29 @@ type v1PipelineSummary struct {
 // GET /api/v1/pipelines — terse list for discovery. LLM agent reads
 // this first to find the pipeline of interest, then calls
 // GET /api/v1/pipelines/:id for full parameter schema before triggering.
+//
+// Filtered by the caller's group visibility — an API key inherits the
+// permissions of its owning user, so a non-admin key only sees pipelines
+// its user's groups have access to.
 func (h *V1Handler) ListPipelines(c echo.Context) error {
 	pipelines, err := h.loader.List()
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to load pipelines")
 	}
-	out := make([]v1PipelineSummary, len(pipelines))
-	for i, p := range pipelines {
-		out[i] = v1PipelineSummary{
+	perms := auth.GetPermissions(c, h.db)
+	canRead := perms.IsAdmin || perms.Has(auth.OpPipelinesRead)
+	out := make([]v1PipelineSummary, 0, len(pipelines))
+	for _, p := range pipelines {
+		if !canRead || !perms.CanSeePipeline(p.ID) {
+			continue
+		}
+		out = append(out, v1PipelineSummary{
 			ID:          p.ID,
 			Name:        p.Name,
 			Description: p.Description,
 			Version:     p.Version,
 			ParamCount:  len(p.Parameters),
-		}
+		})
 	}
 	return c.JSON(http.StatusOK, echo.Map{"pipelines": out})
 }
@@ -114,7 +123,12 @@ func (h *V1Handler) ListPipelines(c echo.Context) error {
 // schema, including which params are required, their types, and
 // default values. This is the agent's "tool schema" for the pipeline.
 func (h *V1Handler) GetPipeline(c echo.Context) error {
-	p, err := h.loader.Get(c.Param("id"))
+	id := c.Param("id")
+	perms := auth.GetPermissions(c, h.db)
+	if !perms.IsAdmin && (!perms.Has(auth.OpPipelinesRead) || !perms.CanSeePipeline(id)) {
+		return echo.NewHTTPError(http.StatusNotFound, "pipeline not found")
+	}
+	p, err := h.loader.Get(id)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, "pipeline not found")
 	}
@@ -157,6 +171,16 @@ type v1RunResponse struct {
 func (h *V1Handler) TriggerRun(c echo.Context) error {
 	claims := auth.GetClaims(c)
 	pipelineID := c.Param("id")
+
+	perms := auth.GetPermissions(c, h.db)
+	if !perms.IsAdmin {
+		if !perms.CanSeePipeline(pipelineID) {
+			return echo.NewHTTPError(http.StatusNotFound, "pipeline not found")
+		}
+		if !perms.Has(auth.OpPipelinesRun) {
+			return echo.NewHTTPError(http.StatusForbidden, "missing required permission: "+auth.OpPipelinesRun)
+		}
+	}
 
 	p, err := h.loader.Get(pipelineID)
 	if err != nil {
@@ -269,6 +293,8 @@ func (h *V1Handler) runResponse(c echo.Context, run dbpkg.ExecutionRun) v1RunRes
 // pipeline_id (optional filter).
 func (h *V1Handler) ListRuns(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 
 	page, _ := strconv.Atoi(c.QueryParam("page"))
 	if page < 1 {
@@ -280,7 +306,7 @@ func (h *V1Handler) ListRuns(c echo.Context) error {
 	}
 
 	q := h.db.Model(&dbpkg.ExecutionRun{})
-	if !claims.IsAdmin {
+	if !seeAll {
 		q = q.Where("user_id = ?", claims.UserID)
 	}
 	if status := c.QueryParam("status"); status != "" {
@@ -319,9 +345,11 @@ func (h *V1Handler) ListRuns(c echo.Context) error {
 // detect completion. Non-admin users can only access their own runs.
 func (h *V1Handler) GetRun(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 	var run dbpkg.ExecutionRun
 	q := h.db.Where("id = ?", c.Param("id"))
-	if !claims.IsAdmin {
+	if !seeAll {
 		q = q.Where("user_id = ?", claims.UserID)
 	}
 	if err := q.First(&run).Error; err != nil {
@@ -340,6 +368,8 @@ func (h *V1Handler) GetRun(c echo.Context) error {
 // suppresses stdout (handy when an agent only wants step + stderr context).
 func (h *V1Handler) GetRunLogs(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 
 	runIDStr := c.Param("id")
 	id64, err := strconv.ParseUint(runIDStr, 10, 64)
@@ -350,7 +380,7 @@ func (h *V1Handler) GetRunLogs(c echo.Context) error {
 	// Authorize against the DB even when serving from the in-memory ring.
 	var run dbpkg.ExecutionRun
 	q := h.db.Select("id, user_id, status").Where("id = ?", id64)
-	if !claims.IsAdmin {
+	if !seeAll {
 		q = q.Where("user_id = ?", claims.UserID)
 	}
 	if err := q.First(&run).Error; err != nil {
@@ -440,8 +470,10 @@ func (h *V1Handler) GetRunLogs(c echo.Context) error {
 // POST /api/v1/runs/:id/cancel — cancel an active or queued run.
 func (h *V1Handler) CancelRun(c echo.Context) error {
 	claims := auth.GetClaims(c)
+	perms := auth.GetPermissions(c, h.db)
+	seeAll := claims.IsAdmin || perms.Has(auth.OpRunsReadAll)
 	q := h.db.Where("id = ? AND status IN ?", c.Param("id"), []string{"running", "queued"})
-	if !claims.IsAdmin {
+	if !seeAll {
 		q = q.Where("user_id = ?", claims.UserID)
 	}
 	var run dbpkg.ExecutionRun
@@ -470,10 +502,16 @@ func (h *V1Handler) ListScripts(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to load scripts")
 	}
-	if scripts == nil {
-		scripts = []script.Script{}
+	perms := auth.GetPermissions(c, h.db)
+	canRead := perms.IsAdmin || perms.Has(auth.OpScriptsRead)
+	out := make([]script.Script, 0, len(scripts))
+	for _, s := range scripts {
+		if !canRead || !perms.CanSeeScript(s.ID) {
+			continue
+		}
+		out = append(out, s)
 	}
-	return c.JSON(http.StatusOK, echo.Map{"scripts": scripts})
+	return c.JSON(http.StatusOK, echo.Map{"scripts": out})
 }
 
 // --- OpenAPI spec ---

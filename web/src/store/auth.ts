@@ -96,6 +96,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   logout: () => {
     sessionStorage.removeItem("token");
     sessionStorage.removeItem("must_change_password");
+    // Best-effort permission-cache wipe so a future user on the same tab
+    // doesn't briefly see the previous user's nav. Lazy-imported to avoid
+    // a top-level circular import (permissions store also reads /api).
+    import("./permissions")
+      .then((m) => m.usePermissionsStore.getState().reset())
+      .catch(() => {});
     set({
       token: null,
       totpPassed: false,

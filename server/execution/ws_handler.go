@@ -113,6 +113,18 @@ func (h *Handler) Execute(c echo.Context) error {
 			_ = wsSend(conn, WSMessage{Type: MsgError, Data: "run is no longer in memory (server might have restarted)"})
 			return nil
 		}
+		// Re-attach must respect the same authz boundary as a fresh GET:
+		// only the run's owner, admins, or someone with runs:read_all may
+		// see its live stream.
+		var ownRun dbpkg.ExecutionRun
+		if err := h.db.Select("id, user_id, status").First(&ownRun, runID).Error; err == nil {
+			perms := auth.LoadEffectivePermissions(h.db, claims.UserID, claims.IsAdmin)
+			seeAll := perms.IsAdmin || perms.Has(auth.OpRunsReadAll)
+			if !seeAll && ownRun.UserID != claims.UserID {
+				_ = wsSend(conn, WSMessage{Type: MsgError, Data: "run not found or not active"})
+				return nil
+			}
+		}
 		// If the run is queued, surface that to the client before the
 		// usual init/backlog so the UI can show a "waiting" banner instead
 		// of an empty step tracker.
@@ -129,6 +141,21 @@ func (h *Handler) Execute(c echo.Context) error {
 		activeRun.Subscribe(conn, true)
 	} else {
 		// --- NEW RUN SCENARIO ---
+		// Visibility + run-permission check. Admins bypass; everyone else
+		// needs the pipeline to be visible to one of their groups AND the
+		// pipelines:run operation. A failure here pretends the pipeline
+		// doesn't exist rather than leaking that it does.
+		perms := auth.LoadEffectivePermissions(h.db, claims.UserID, claims.IsAdmin)
+		if !perms.IsAdmin {
+			if !perms.CanSeePipeline(pipelineID) {
+				_ = wsSend(conn, WSMessage{Type: MsgError, Data: "pipeline not found"})
+				return nil
+			}
+			if !perms.Has(auth.OpPipelinesRun) {
+				_ = wsSend(conn, WSMessage{Type: MsgError, Data: "missing permission: " + auth.OpPipelinesRun})
+				return nil
+			}
+		}
 		p, err := h.loader.Get(pipelineID)
 		if err != nil {
 			_ = wsSend(conn, WSMessage{Type: MsgError, Data: "pipeline not found"})

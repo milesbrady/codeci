@@ -90,6 +90,51 @@ type AppSettings struct {
 	GitHubConnectedAt    *time.Time
 }
 
+// Group is a named bundle of permissions plus a visibility scope over
+// pipelines and scripts. A user can belong to many groups; the effective
+// permission set is the union across all of them. Admins (User.Role ==
+// "admin") bypass groups entirely.
+//
+// Operations is a comma-separated string of operation tokens (the canonical
+// list lives in auth.AllOperations). PipelineMode / ScriptMode are "all" —
+// every pipeline/script is visible — or "selected" — only those linked via
+// GroupPipelineAccess / GroupScriptAccess are visible.
+//
+// IsSystem marks the seeded "Everyone" group so the UI can prevent its
+// deletion and so the bootstrap logic recognises it on re-runs.
+type Group struct {
+	ID           uint   `gorm:"primaryKey"`
+	Name         string `gorm:"uniqueIndex;not null"`
+	Description  string `gorm:"not null;default:''"`
+	IsSystem     bool   `gorm:"not null;default:false"`
+	PipelineMode string `gorm:"not null;default:'all'"` // all | selected
+	ScriptMode   string `gorm:"not null;default:'all'"` // all | selected
+	Operations   string `gorm:"type:text;not null;default:''"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+type UserGroup struct {
+	UserID    uint      `gorm:"primaryKey;autoIncrement:false"`
+	GroupID   uint      `gorm:"primaryKey;autoIncrement:false;index"`
+	CreatedAt time.Time
+}
+
+// GroupPipelineAccess / GroupScriptAccess are only consulted when the
+// owning group has the corresponding *Mode set to "selected". Rows for
+// "all"-mode groups are ignored (and not written by the API).
+type GroupPipelineAccess struct {
+	GroupID    uint      `gorm:"primaryKey;autoIncrement:false"`
+	PipelineID string    `gorm:"primaryKey"`
+	CreatedAt  time.Time
+}
+
+type GroupScriptAccess struct {
+	GroupID   uint      `gorm:"primaryKey;autoIncrement:false"`
+	ScriptID  string    `gorm:"primaryKey"`
+	CreatedAt time.Time
+}
+
 // PipelineTrigger maps an external event source (GitHub push/PR/release, or a
 // generic signed HTTP POST) to a pipeline that should run when the event
 // fires. DefaultParamsJSON is the locked-in parameter set used for every
