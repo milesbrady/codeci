@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: devops
+      POSTGRES_USER: devops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devops}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devops -d devops"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgres://devops:${POSTGRES_PASSWORD:-devops}@postgres:5432/devops?sslmode=disable
+      - PIPELINES_DIR=/app/pipelines
+      - SCRIPTS_DIR=/app/user-scripts
+      - ALLOWED_ORIGIN=http://localhost:5173
+      - RUNNER_IMAGE=codeci-runner
+      - DISABLE_TOTP=${DISABLE_TOTP:-false}
+    volumes:
+      - ./pipelines:/app/pipelines
+      - ./user-scripts:/app/user-scripts
+      - ./repo-cache:/tmp/codeci-deploy
+      - ~/.aws:/root/.aws:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  runner:
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+    volumes:
+      - ./pipelines:/app/pipelines
+      - ./user-scripts:/app/user-scripts
+      - ./repo-cache:/tmp/codeci-deploy
+      - ~/.aws:/root/.aws:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env
+    command: "true"
+    restart: "no"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
