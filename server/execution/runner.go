@@ -190,14 +190,44 @@ func isProtectedTag(repoTag, runnerImage string) bool {
 }
 
 // repoCachePath returns the on-disk root the backend can read pipeline
-// scripts from when the YAML references "/tmp/codeci-deploy/...". In both
-// docker-compose and the helm chart the repo cache is mounted at the same
-// path on the backend pod, so the default works without configuration.
+// scripts from when the YAML references "/tmp/codeci-deploy/...". The
+// path is *advisory* for the substep planner (which tries to inline a
+// referenced script when planning); the runner pods themselves use a
+// per-run workspace at /tmp/codeci-deploy that the planner has no view
+// into. The default kept here for back-compat lets the planner still
+// inline scripts when the user has manually pre-populated the path.
 func repoCachePath() string {
 	if p := os.Getenv("REPO_CACHE_PATH"); p != "" {
 		return p
 	}
 	return "/tmp/codeci-deploy"
+}
+
+// runsRootContainerPath is where the backend container expects to find the
+// per-run scratch bind mount. The host path behind it is resolved via
+// `docker inspect` and used to launch the runner with -v <host>:/tmp/codeci-deploy.
+const runsRootContainerPath = "/var/lib/codeci/runs"
+
+// getBackendMountSource returns the host-side path bind-mounted to destPath
+// inside the running backend container, or "" if no such mount exists.
+func getBackendMountSource(destPath string) (string, error) {
+	hostname, _ := os.Hostname()
+	format := fmt.Sprintf(`{{range .Mounts}}{{if eq .Destination "%s"}}{{.Source}}{{end}}{{end}}`, destPath)
+	out, err := exec.Command("docker", "inspect", hostname, "--format", format).Output()
+	if err != nil {
+		return "", fmt.Errorf("docker inspect: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// mountDest returns the destination path of a `src:dest[:ro]` docker volume
+// spec, or "" if the spec is malformed.
+func mountDest(spec string) string {
+	parts := strings.SplitN(spec, ":", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[1]
 }
 
 // stepResult is what each per-step runner returns. Reason and LastStderr
@@ -341,6 +371,24 @@ func setupDockerRunner(ctx context.Context, send func(WSMessage), runnerImage st
 	containerName := fmt.Sprintf("codeci-runner-%d", runID)
 	imagesBefore := snapshotImageIDs()
 
+	// Resolve the host-side path behind the backend's /var/lib/codeci/runs
+	// bind mount. We use it to give *this* runner an isolated workspace
+	// mounted at /tmp/codeci-deploy — so two concurrent runs can never
+	// stomp on each other's checkout.
+	hostRunsRoot, err := getBackendMountSource(runsRootContainerPath)
+	if err != nil || hostRunsRoot == "" {
+		reason := fmt.Sprintf("backend missing %s bind mount — cannot create per-run workspace (configure docker-compose runner-runs volume)", runsRootContainerPath)
+		send(WSMessage{Type: MsgError, Data: reason})
+		return nil, nil, 1, reason
+	}
+	containerRunsDir := fmt.Sprintf("%s/%d", runsRootContainerPath, runID)
+	hostRunsDir := fmt.Sprintf("%s/%d", hostRunsRoot, runID)
+	if mkErr := os.MkdirAll(containerRunsDir, 0o755); mkErr != nil {
+		reason := fmt.Sprintf("failed to create per-run workspace %s: %v", containerRunsDir, mkErr)
+		send(WSMessage{Type: MsgError, Data: reason})
+		return nil, nil, 1, reason
+	}
+
 	// 1. Get volume mounts from current backend container
 	hostname, _ := os.Hostname()
 	volCmd := fmt.Sprintf("docker inspect %s --format '{{range .Mounts}}-v {{.Source}}:{{.Destination}}{{if not .RW}}:ro{{end}} {{end}}'", hostname)
@@ -350,12 +398,29 @@ func setupDockerRunner(ctx context.Context, send func(WSMessage), runnerImage st
 		send(WSMessage{Type: MsgError, Data: reason})
 		return nil, nil, 1, reason
 	}
-	// Filter out docker config mounts — the runner gets its own writable config
-	// so pipelines can call `docker login` without hitting a read-only bind mount.
+	// Filter out mounts the runner shouldn't inherit verbatim:
+	//   - .docker config: runner writes its own config so pipelines can
+	//     `docker login` without hitting a read-only bind.
+	//   - /var/lib/codeci/runs: backend sees *all* runs; runner only gets
+	//     its own subdir, mounted explicitly at /tmp/codeci-deploy below.
+	//   - /tmp/codeci-deploy: legacy shared mount. After the mirror-cache
+	//     refactor compose remaps this to /var/cache/codeci/mirrors, but
+	//     drop defensively in case a stale compose file lingers.
 	rawFlags := strings.Fields(strings.TrimSpace(string(volOut)))
 	var volFlags []string
 	for i := 0; i < len(rawFlags); i++ {
-		if rawFlags[i] == "-v" && i+1 < len(rawFlags) && strings.Contains(rawFlags[i+1], ".docker") {
+		if rawFlags[i] == "-v" && i+1 < len(rawFlags) {
+			spec := rawFlags[i+1]
+			if strings.Contains(spec, ".docker") {
+				i++
+				continue
+			}
+			switch mountDest(spec) {
+			case runsRootContainerPath, "/tmp/codeci-deploy":
+				i++
+				continue
+			}
+			volFlags = append(volFlags, "-v", spec)
 			i++
 			continue
 		}
@@ -364,6 +429,9 @@ func setupDockerRunner(ctx context.Context, send func(WSMessage), runnerImage st
 
 	args := []string{"run", "-d", "--rm", "--name", containerName}
 	args = append(args, volFlags...)
+	// Explicit per-run workspace. Sits where pipelines expect the checkout
+	// (/tmp/codeci-deploy) but is isolated per run on the host.
+	args = append(args, "-v", fmt.Sprintf("%s:/tmp/codeci-deploy", hostRunsDir))
 	if pat := os.Getenv("GIT_PAT"); pat != "" {
 		args = append(args, "-e", "GIT_PAT="+pat)
 	}
@@ -381,6 +449,7 @@ func setupDockerRunner(ctx context.Context, send func(WSMessage), runnerImage st
 	cleanup := func() {
 		_ = exec.Command("docker", "stop", "-t", "2", containerName).Run()
 		purgeNewImages(imagesBefore, runnerImage)
+		_ = os.RemoveAll(containerRunsDir)
 	}
 
 	dockerConfigSetup := `mkdir -p /app /root/.docker && printf '{"credsStore":"ecr-login"}\n' > /root/.docker/config.json`

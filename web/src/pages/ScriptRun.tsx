@@ -62,7 +62,7 @@ export function ScriptRun() {
         }
       />
 
-      <div className="p-8 h-[calc(100vh-85px)]">
+      <div className="p-4 md:p-8 h-[calc(100vh-56px)] md:h-[calc(100vh-85px)]">
         <LogTerminal messages={messages} running={running} />
       </div>
     </Layout>

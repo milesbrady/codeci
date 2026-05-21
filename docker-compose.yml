@@ -32,7 +32,14 @@ services:
     volumes:
       - ./pipelines:/app/pipelines
       - ./user-scripts:/app/user-scripts
-      - ./repo-cache:/tmp/codeci-deploy
+      # Shared bare-mirror cache. Runner pods clone from these mirrors
+      # (single-branch, shallow) into per-run workspaces instead of pulling
+      # from GitHub every time.
+      - ./repo-cache:/var/cache/codeci/mirrors
+      # Per-run scratch root. The backend creates ./runner-runs/<runID>
+      # for each pipeline run and mounts that subdir into the runner at
+      # /tmp/codeci-deploy, so concurrent runs are filesystem-isolated.
+      - ./runner-runs:/var/lib/codeci/runs
       - ~/.aws:/root/.aws:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -47,7 +54,8 @@ services:
     volumes:
       - ./pipelines:/app/pipelines
       - ./user-scripts:/app/user-scripts
-      - ./repo-cache:/tmp/codeci-deploy
+      - ./repo-cache:/var/cache/codeci/mirrors
+      - ./runner-runs:/var/lib/codeci/runs
       - ~/.aws:/root/.aws:ro
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:

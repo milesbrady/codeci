@@ -31,15 +31,39 @@ const (
 )
 
 // cloneStepSnippet is the canonical clone-or-update bash block injected as
-// the first step when a pipeline declares a top-level `repository:`. It is
-// kept verbatim from the pattern used in pipelines/*.yaml.
-const cloneStepSnippet = `if [ -d /tmp/codeci-deploy/.git ]; then
-  git -C /tmp/codeci-deploy remote set-url origin ${git_repo}
-  git -C /tmp/codeci-deploy fetch --quiet origin ${git_branch}
-  git -C /tmp/codeci-deploy checkout -B ${git_branch} FETCH_HEAD
-else
-  git clone --branch ${git_branch} --depth 1 ${git_repo} /tmp/codeci-deploy
-fi
+// the first step when a pipeline declares a top-level `repository:`.
+//
+// Two-tier model:
+//   1. A shared *bare mirror* at /var/cache/codeci/mirrors/<sha>.git acts as a
+//      local cache for the repo. flock serializes concurrent `remote update`
+//      calls when multiple runs target the same mirror.
+//   2. Each run gets its own working tree at /tmp/codeci-deploy (provided as
+//      an emptyDir on k8s and a per-run host bind in docker). The clone is
+//      --single-branch --depth 1 from the local mirror, so it's fast and
+//      isolated from any other in-flight run's checkout.
+const cloneStepSnippet = `set -e
+REPO="${git_repo}"
+BRANCH="${git_branch}"
+MIRROR_ROOT="/var/cache/codeci/mirrors"
+SHA=$(printf '%s' "$REPO" | sha1sum | awk '{print $1}')
+MIRROR="$MIRROR_ROOT/$SHA.git"
+LOCK="$MIRROR_ROOT/$SHA.lock"
+mkdir -p "$MIRROR_ROOT"
+(
+  flock 9
+  if [ ! -d "$MIRROR" ]; then
+    git clone --mirror --quiet "$REPO" "$MIRROR"
+  else
+    git -C "$MIRROR" remote set-url origin "$REPO"
+    git -C "$MIRROR" remote update --prune
+  fi
+) 9>"$LOCK"
+# /tmp/codeci-deploy is the mount point (emptyDir on k8s, bind on docker) —
+# unlinking the directory itself fails with EBUSY. Empty its contents in
+# place so git clone has a clean target.
+mkdir -p /tmp/codeci-deploy
+find /tmp/codeci-deploy -mindepth 1 -delete
+git clone --branch "$BRANCH" --single-branch --depth 1 "$MIRROR" /tmp/codeci-deploy
 echo "Branch: $(git -C /tmp/codeci-deploy branch --show-current) @ $(git -C /tmp/codeci-deploy rev-parse --short HEAD)"
 `
 
@@ -101,6 +125,22 @@ func (p *Pipeline) Expand() {
 			Run:    cloneStepSnippet,
 			Runner: "docker",
 		}}, p.Steps...)
+	}
+
+	// With a per-run checkout living at /tmp/codeci-deploy, every user step
+	// should already start there — saves authors from repeating `cd
+	// /tmp/codeci-deploy` at the top of each step. Skip the clone step
+	// itself (it bootstraps the directory) and any non-shell step.
+	// Existing pipelines that still write `cd /tmp/codeci-deploy` keep
+	// working: the second cd is a harmless no-op.
+	for i := range p.Steps {
+		if p.Steps[i].Name == "Clone / update repository" {
+			continue
+		}
+		if p.Steps[i].Run == "" {
+			continue
+		}
+		p.Steps[i].Run = "cd /tmp/codeci-deploy\n" + p.Steps[i].Run
 	}
 }
 

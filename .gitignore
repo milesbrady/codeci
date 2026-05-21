@@ -46,6 +46,7 @@ Desktop.ini
 *~
 
 repo-cache/
+runner-runs/
 pipelines/
 infra/
 user-scripts/

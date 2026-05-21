@@ -49,7 +49,7 @@ export function ScriptCreate() {
         }
       />
 
-      <div className="flex flex-col gap-4 p-8 h-[calc(100vh-85px)]">
+      <div className="flex flex-col gap-4 p-4 md:p-8 h-[calc(100vh-56px)] md:h-[calc(100vh-85px)]">
         <div className="flex flex-col gap-1.5 max-w-md">
           <label className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
             Script Name
@@ -130,7 +130,7 @@ export function ScriptEdit() {
         }
       />
 
-      <div className="p-8 h-[calc(100vh-85px)]">
+      <div className="p-4 md:p-8 h-[calc(100vh-56px)] md:h-[calc(100vh-85px)]">
         <ShellEditor
           value={content}
           onChange={setContent}

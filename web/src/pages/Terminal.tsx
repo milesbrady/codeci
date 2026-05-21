@@ -140,7 +140,7 @@ export default function TerminalPage() {
           <div className="flex items-center gap-2">
             <StatusBadge status={status} />
             {containerName && (
-              <span className="text-xs text-zinc-500 font-mono truncate max-w-[280px]" title={containerName}>
+              <span className="text-xs text-zinc-500 font-mono truncate max-w-[140px] sm:max-w-[280px]" title={containerName}>
                 {containerName}
               </span>
             )}
@@ -155,7 +155,7 @@ export default function TerminalPage() {
         </div>
       )}
 
-      <div className="flex flex-col px-8 py-4 h-[calc(100vh-85px)]">
+      <div className="flex flex-col px-4 py-3 md:px-8 md:py-4 h-[calc(100vh-56px)] md:h-[calc(100vh-85px)]">
         <div className="flex items-center justify-between mb-2 text-xs text-zinc-500">
           <span className="flex items-center gap-1.5">
             <TerminalSquare className="h-3.5 w-3.5" />

@@ -370,7 +370,16 @@ func renderRunnerPodYAML(name, image string, env k8sRunnerEnv) (string, error) {
 					"volumeMounts": []any{
 						map[string]any{"name": "pipelines", "mountPath": "/app/pipelines", "readOnly": true},
 						map[string]any{"name": "scripts", "mountPath": "/app/user-scripts", "readOnly": true},
-						map[string]any{"name": "repo-cache", "mountPath": "/tmp/codeci-deploy"},
+						// Per-pod working tree. emptyDir is ephemeral with the
+						// pod, so two concurrent runner pods can no longer
+						// collide on /tmp/codeci-deploy (the failure mode when
+						// the shared repo-cache PVC was mounted here).
+						map[string]any{"name": "workspace", "mountPath": "/tmp/codeci-deploy"},
+						// Shared bare-mirror cache. The cloneStepSnippet does
+						// `git clone --mirror`/`remote update` here under a
+						// per-mirror flock, then shallow-clones single-branch
+						// into the workspace above.
+						map[string]any{"name": "repo-cache", "mountPath": "/var/cache/codeci/mirrors"},
 					},
 				},
 			},
@@ -382,6 +391,10 @@ func renderRunnerPodYAML(name, image string, env k8sRunnerEnv) (string, error) {
 				map[string]any{
 					"name":                  "scripts",
 					"persistentVolumeClaim": map[string]string{"claimName": env.ScriptsPVC},
+				},
+				map[string]any{
+					"name":     "workspace",
+					"emptyDir": map[string]any{},
 				},
 				map[string]any{
 					"name":                  "repo-cache",
